@@ -172,6 +172,7 @@ def model_train(train_data, val_data, test_data, model_joint, args, logger, forw
 
     best_model = copy.deepcopy(model_joint)
     optimizer = optimizers(model_joint, args)
+    saved_best = False
 
     best_metrics_dict = {'Best_HR@5': 0, 'Best_NDCG@5': 0, 'Best_HR@10': 0, 'Best_NDCG@10': 0,
                          'Best_HR@20': 0, 'Best_NDCG@20': 0}
@@ -256,6 +257,7 @@ def model_train(train_data, val_data, test_data, model_joint, args, logger, forw
                 logger.info(best_epoch)
                 if flag_update >= 3:
                     best_model = copy.deepcopy(model_joint)
+                    saved_best = True
                     if forward_flag:
                         save_dir = os.path.join('.', 'saved_model', f"{args.s_dataset}_{args.t_dataset}")
                         os.makedirs(save_dir, exist_ok=True)
@@ -266,13 +268,14 @@ def model_train(train_data, val_data, test_data, model_joint, args, logger, forw
     logger.info(best_metrics_dict)
     logger.info(best_epoch)
 
-    best_model = copy.deepcopy(model_joint)
-
-    if forward_flag:
-        save_dir = os.path.join('.', 'saved_model', f"{args.s_dataset}_{args.t_dataset}")
-        os.makedirs(save_dir, exist_ok=True)
-        model_to_save = model_joint.module if hasattr(model_joint, 'module') else model_joint
-        torch.save(model_to_save.state_dict(), os.path.join(save_dir, 'model.pth'))
+    if not saved_best:
+        logger.info('No best model found during training, using last epoch model')
+        best_model = copy.deepcopy(model_joint)
+        if forward_flag:
+            save_dir = os.path.join('.', 'saved_model', f"{args.s_dataset}_{args.t_dataset}")
+            os.makedirs(save_dir, exist_ok=True)
+            model_to_save = model_joint.module if hasattr(model_joint, 'module') else model_joint
+            torch.save(model_to_save.state_dict(), os.path.join(save_dir, 'model.pth'))
 
     test_metrics_dict_mean = {}
     if test_enabled:

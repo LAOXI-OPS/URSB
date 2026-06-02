@@ -168,6 +168,7 @@ class SBXstart(nn.Module):
         self.side_seq_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         nn.init.zeros_(self.side_seq_proj.weight)
         self.x1_head = nn.Linear(self.hidden_size, self.hidden_size)
+        self.pool_query = nn.Parameter(torch.randn(self.hidden_size))
 
     def timestep_embedding(self, timesteps, dim, max_period=10000):
         half = dim // 2
@@ -178,6 +179,13 @@ class SBXstart(nn.Module):
         if dim % 2:
             embedding = th.cat([embedding, th.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
+
+    def _pool(self, rep, mask_seq):
+        attn_scores = torch.matmul(rep, self.pool_query)  # [B, L]
+        if mask_seq is not None:
+            attn_scores = attn_scores.masked_fill(mask_seq == 0, -1e9)
+        attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)  # [B, L, 1]
+        return (rep * attn_weights).sum(dim=1)  # [B, d]
 
     def forward(self, rep_item, x_t, t, mask_seq, side_seq=None):
         emb_t = self.time_embed(self.timestep_embedding(t, self.hidden_size))
@@ -194,8 +202,9 @@ class SBXstart(nn.Module):
 
         rep_sb = self.att(rep_item + lambda_unc * x_t.unsqueeze(1), mask_seq)
         rep_sb = self.norm_sb_rep(self.dropout(rep_sb))
-        out = rep_sb[:, -1, :]
-        pred_x1 = self.x1_head(rep_sb[:, -1, :])
+        pooled = self._pool(rep_sb, mask_seq)
+        out = pooled
+        pred_x1 = self.x1_head(pooled)
         return out, rep_sb, pred_x1
 
 
@@ -242,11 +251,19 @@ class SBRec(nn.Module):
         self.schedule_sampler = create_named_schedule_sampler(schedule_sampler_name, self.num_timesteps)
 
         self.xstart_model = SBXstart(self.hidden_size, args)
+        self.x1_pool_query = nn.Parameter(torch.randn(self.hidden_size))
 
     def _expand(self, v, x):
         while v.dim() < x.dim():
             v = v.unsqueeze(-1)
         return v
+
+    def _pool_sequence(self, seq, mask):
+        attn_scores = th.matmul(seq, self.x1_pool_query)  # [B, L]
+        if mask is not None:
+            attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
+        attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)  # [B, L, 1]
+        return (seq * attn_weights).sum(dim=1)  # [B, d]
 
     def _scale_timesteps(self, t):
         if self.rescale_timesteps:
@@ -288,7 +305,7 @@ class SBRec(nn.Module):
 
     def reverse_p_sample(self, item_rep, item_rep1, noise_x_t, mask_seq):
         if item_rep.dim() == 3:
-            x1 = item_rep[:, -1, :]
+            x1 = self._pool_sequence(item_rep, mask_seq)
         elif item_rep.dim() == 2:
             x1 = item_rep
         else:
@@ -301,14 +318,14 @@ class SBRec(nn.Module):
         for prev_step, step in zip(rev[1:], rev[:-1]):
             t = th.full((xt.shape[0],), step, device=xt.device, dtype=th.long)
             # item_rep1 can provide auxiliary endpoint info at early decoding steps
-            x1_step = x1 + self.std_fwd[0] * item_rep1[:, -1, :]
+            x1_step = x1 + self.std_fwd[0] * self._pool_sequence(item_rep1, mask_seq)
             pred_x0, _, _ = self.xstart_model(item_rep, xt, self._scale_timesteps(t), mask_seq)
             xt = self.ode_step_reverse(prev_step, step, xt, pred_x0, x1_step)
         return xt
 
     def forward(self, item_rep, item_tag, mask_seq, side_seq=None):
         if item_rep.dim() == 3:
-            x1 = item_rep[:, -1, :]
+            x1 = self._pool_sequence(item_rep, mask_seq)
         elif item_rep.dim() == 2:
             x1 = item_rep
         else:
