@@ -22,6 +22,7 @@ class AttSBModel(nn.Module):
         self.loss_ce = nn.CrossEntropyLoss()
         self.loss_mse = nn.MSELoss()
         self.lambda_x1 = getattr(args, 'lambda_x1', 0.1)
+        self.lambda_bpr = getattr(args, 'lambda_bpr', 0.0)
 
     def reverse(self, item_rep, item_rep1, noise_x_t, mask_seq):
         return self.sb.reverse_p_sample(item_rep, item_rep1, noise_x_t, mask_seq)
@@ -34,6 +35,10 @@ class AttSBModel(nn.Module):
         loss = self.loss_ce(scores, labels.squeeze(-1))
         if x1 is not None and pred_x1 is not None:
             loss = loss + self.lambda_x1 * self.loss_mse(pred_x1, x1.detach())
+        if self.lambda_bpr > 0:
+            pos_scores = scores.gather(1, labels)  # [B, 1]
+            bpr = -(pos_scores - scores).sigmoid().log().mean()
+            loss = loss + self.lambda_bpr * bpr
         return loss
 
     def sb_rep_pre(self, rep_sb, forward_flag):

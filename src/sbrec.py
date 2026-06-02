@@ -252,6 +252,7 @@ class SBRec(nn.Module):
 
         self.xstart_model = SBXstart(self.hidden_size, args)
         self.x1_pool_query = nn.Parameter(torch.randn(self.hidden_size))
+        self.use_sde = getattr(args, 'use_sde', False)
 
     def _expand(self, v, x):
         while v.dim() < x.dim():
@@ -275,6 +276,11 @@ class SBRec(nn.Module):
         mu0 = self._expand(self.alpha[step] * self.mu_x0[step], x0)
         mu1 = self._expand(self.alpha_bar[step] * self.mu_x1[step], x0)
         xt = mu0 * x0 + mu1 * x1
+        if self.use_sde:
+            sigma_t = self._expand(self.std_fwd[step], x0)
+            sigma_bar_t = self._expand(self.std_bwd[step], x0)
+            noise_std = th.sqrt(sigma_t ** 2 * sigma_bar_t ** 2 / self.sigma_1_sq)
+            xt = xt + noise_std * th.randn_like(xt)
         return xt.detach()
 
     def ode_step_reverse(self, t, s, x_s, pred_x0, x1):

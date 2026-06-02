@@ -69,6 +69,8 @@ parser.add_argument('--schedule_sampler_name', type=str, default='lossaware')
 parser.add_argument('--diffusion_steps', type=int, default=32)
 parser.add_argument('--lambda_uncertainty', type=float, default=0.001)
 parser.add_argument('--lambda_x1', type=float, default=0.1)
+parser.add_argument('--lambda_bpr', type=float, default=0.0)
+parser.add_argument('--use_sde', action='store_true', default=False)
 parser.add_argument('--rescale_timesteps', default=True)
 parser.add_argument('--interval', type=int, default=1000)
 parser.add_argument('--beta_min', type=float, default=0.01)
@@ -227,6 +229,8 @@ def main(args):
     rec_sb_joint_model = AttSBModel(sb_rec, args)
 
     forward_flag = True
+    bpr_val = args.lambda_bpr
+    args.lambda_bpr = 0.0
     model_train(
         s_tra_data, s_val_data, s_test_data, rec_sb_joint_model, args, logger, forward_flag)
 
@@ -234,6 +238,7 @@ def main(args):
     rec_sb_joint_model.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
 
     args.item_num = target_item_num
+    args.lambda_bpr = bpr_val
     args.eval_interval = 2
     args.patience = args.ft_epochs
     args.epochs = args.ft_epochs
