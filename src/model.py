@@ -19,10 +19,14 @@ class AttSBModel(nn.Module):
         self.side_seq_embedding = nn.Embedding(args.source_item_num + 1, self.emb_dim)
         nn.init.zeros_(self.side_seq_embedding.weight)
         self.side_seq_embedding.weight.requires_grad = False
+        self.use_position = getattr(args, 'use_position', True)
         self.loss_ce = nn.CrossEntropyLoss()
         self.loss_mse = nn.MSELoss()
         self.lambda_x1 = getattr(args, 'lambda_x1', 0.1)
         self.lambda_bpr = getattr(args, 'lambda_bpr', 0.0)
+
+    def set_epoch(self, epoch):
+        self.sb.set_epoch(epoch)
 
     def reverse(self, item_rep, item_rep1, noise_x_t, mask_seq):
         return self.sb.reverse_p_sample(item_rep, item_rep1, noise_x_t, mask_seq)
@@ -60,7 +64,8 @@ class AttSBModel(nn.Module):
         else:
             item_embeddings = self.target_embeddings(sequence)
 
-        item_embeddings = item_embeddings + position_embeddings
+        if self.use_position:
+            item_embeddings = item_embeddings + position_embeddings
         item_embeddings = self.embed_dropout(item_embeddings)
         item_embeddings = self.LayerNorm(item_embeddings)
 

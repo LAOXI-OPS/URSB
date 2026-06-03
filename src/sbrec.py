@@ -151,6 +151,38 @@ class TransformerRep(nn.Module):
         return hidden
 
 
+class CrossAttention(nn.Module):
+    def __init__(self, hidden_size, heads, dropout):
+        super().__init__()
+        assert hidden_size % heads == 0
+        self.d_head = hidden_size // heads
+        self.heads = heads
+        self.q_proj = nn.Linear(hidden_size, hidden_size)
+        self.k_proj = nn.Linear(hidden_size, hidden_size)
+        self.v_proj = nn.Linear(hidden_size, hidden_size)
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, query, key_value, kv_mask):
+        B = query.shape[0]
+        q = self.q_proj(query).view(B, -1, self.heads, self.d_head).transpose(1, 2)
+        k = self.k_proj(key_value).view(B, -1, self.heads, self.d_head).transpose(1, 2)
+        v = self.v_proj(key_value).view(B, -1, self.heads, self.d_head).transpose(1, 2)
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_head)
+
+        if kv_mask is not None:
+            mask = kv_mask.unsqueeze(1).unsqueeze(2)
+            attn = attn.masked_fill(mask == 0, -1e9)
+
+        attn_weights = F.softmax(attn, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        out = torch.matmul(attn_weights, v)
+        out = out.transpose(1, 2).contiguous().view(B, -1, self.heads * self.d_head)
+        out = self.out_proj(out)
+        return out
+
+
 class SBXstart(nn.Module):
     def __init__(self, hidden_size, args):
         super().__init__()
@@ -161,14 +193,17 @@ class SBXstart(nn.Module):
             SiLU(),
             nn.Linear(time_embed_dim, self.hidden_size),
         )
-        self.att = TransformerRep(args)
+        self.seq_att = TransformerRep(args)
+        self.seq_norm = LayerNorm(self.hidden_size)
+
+        self.cross_attn = CrossAttention(self.hidden_size, heads=4, dropout=args.dropout)
+        self.cross_norm1 = LayerNorm(self.hidden_size)
+        self.cross_norm2 = LayerNorm(self.hidden_size)
+        self.cross_ffn = PositionwiseFeedForward(self.hidden_size, args.dropout)
+
         self.lambda_uncertainty = args.lambda_uncertainty
         self.dropout = nn.Dropout(args.dropout)
-        self.norm_sb_rep = LayerNorm(self.hidden_size)
-        self.side_seq_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
-        nn.init.zeros_(self.side_seq_proj.weight)
         self.x1_head = nn.Linear(self.hidden_size, self.hidden_size)
-        self.pool_query = nn.Parameter(torch.randn(self.hidden_size))
 
     def timestep_embedding(self, timesteps, dim, max_period=10000):
         half = dim // 2
@@ -180,32 +215,29 @@ class SBXstart(nn.Module):
             embedding = th.cat([embedding, th.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
-    def _pool(self, rep, mask_seq):
-        attn_scores = torch.matmul(rep, self.pool_query)  # [B, L]
-        if mask_seq is not None:
-            attn_scores = attn_scores.masked_fill(mask_seq == 0, -1e9)
-        attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)  # [B, L, 1]
-        return (rep * attn_weights).sum(dim=1)  # [B, d]
-
     def forward(self, rep_item, x_t, t, mask_seq, side_seq=None):
+        # 1. Time embedding on x_t (noise state)
         emb_t = self.time_embed(self.timestep_embedding(t, self.hidden_size))
-        x_t = x_t + emb_t
+        x_t_emb = x_t + emb_t  # [B, d]
 
-        if side_seq is not None:
-            side_cond = self.side_seq_proj(side_seq)
-            rep_item = rep_item + side_cond.unsqueeze(1)
+        # 2. Uncertainty noise on x_t only (not mixed into sequence)
+        x_t_emb = x_t_emb + self.lambda_uncertainty * th.randn_like(x_t_emb)
 
-        lambda_unc = th.normal(
-            mean=th.full(rep_item.shape, self.lambda_uncertainty),
-            std=th.full(rep_item.shape, self.lambda_uncertainty),
-        ).to(x_t.device)
+        # 3. Sequence through self-attention (condition encoding)
+        seq_features = self.seq_att(rep_item, mask_seq)  # [B, L, d]
+        seq_features = self.seq_norm(seq_features)
 
-        rep_sb = self.att(rep_item + lambda_unc * x_t.unsqueeze(1), mask_seq)
-        rep_sb = self.norm_sb_rep(self.dropout(rep_sb))
-        pooled = self._pool(rep_sb, mask_seq)
-        out = pooled
-        pred_x1 = self.x1_head(pooled)
-        return out, rep_sb, pred_x1
+        # 4. Cross-attention: x_t (query) attends to seq_features (key/value)
+        x_t_query = x_t_emb.unsqueeze(1)  # [B, 1, d]
+        cross_out = self.cross_attn(self.cross_norm1(x_t_query), seq_features, mask_seq)
+        x_t_out = x_t_emb.unsqueeze(1) + self.dropout(cross_out)  # [B, 1, d]
+
+        # 5. FFN
+        x_t_out = x_t_out + self.dropout(self.cross_ffn(self.cross_norm2(x_t_out)))
+
+        out = x_t_out.squeeze(1)  # [B, d]
+        pred_x1 = self.x1_head(out)
+        return out, seq_features, pred_x1
 
 
 class SBRec(nn.Module):
@@ -253,6 +285,8 @@ class SBRec(nn.Module):
         self.xstart_model = SBXstart(self.hidden_size, args)
         self.x1_pool_query = nn.Parameter(torch.randn(self.hidden_size))
         self.use_sde = getattr(args, 'use_sde', False)
+        self.reverse_noise_scale = float(getattr(args, 'reverse_noise_scale', 0.0))
+        self.sde_reverse_noise = float(getattr(args, 'sde_reverse_noise', 0.0))
 
     def _expand(self, v, x):
         while v.dim() < x.dim():
@@ -307,7 +341,14 @@ class SBRec(nn.Module):
         coef_f = self._expand(coef_f, x_s)
         coef_x1 = self._expand(coef_x1, x_s)
 
-        return coef_xs * x_s + coef_f * pred_x0 + coef_x1 * x1
+        x_t = coef_xs * x_s + coef_f * pred_x0 + coef_x1 * x1
+
+        if self.sde_reverse_noise > 0:
+            noise_std = sigma_t * sigma_bar_t / th.sqrt(self.sigma_1_sq)
+            noise_std = self._expand(noise_std, x_t)
+            x_t = x_t + self.sde_reverse_noise * noise_std * th.randn_like(x_t)
+
+        return x_t
 
     def reverse_p_sample(self, item_rep, item_rep1, noise_x_t, mask_seq):
         if item_rep.dim() == 3:
@@ -318,16 +359,46 @@ class SBRec(nn.Module):
             raise ValueError("Unsupported tensor shape for SB endpoint x1")
 
         steps = space_indices(self.num_timesteps, self.sample_steps)
-        xt = x1.detach() + self.std_fwd[0] * noise_x_t
+        xt = x1.detach() + self.reverse_noise_scale * noise_x_t
+        if self.reverse_noise_scale > 0:
+            self._stats('reverse_init_noisy: scale/ x1 / xt',
+                        th.tensor([self.reverse_noise_scale]), x1, xt)
         rev = list(steps)[::-1]
+        self._stats('reverse_init: x1 / xt', x1, xt)
 
-        for prev_step, step in zip(rev[1:], rev[:-1]):
+        for idx, (prev_step, step) in enumerate(zip(rev[1:], rev[:-1])):
             t = th.full((xt.shape[0],), step, device=xt.device, dtype=th.long)
-            # item_rep1 can provide auxiliary endpoint info at early decoding steps
-            x1_step = x1 + self.std_fwd[0] * self._pool_sequence(item_rep1, mask_seq)
             pred_x0, _, _ = self.xstart_model(item_rep, xt, self._scale_timesteps(t), mask_seq)
-            xt = self.ode_step_reverse(prev_step, step, xt, pred_x0, x1_step)
+            xt = self.ode_step_reverse(prev_step, step, xt, pred_x0, x1)
+            if idx == 0 or idx == len(rev) - 2:
+                self._stats(f'reverse_step{idx}: pred_x0 / xt_next', pred_x0, xt)
+        self._stats('reverse_final: xt / x1 / cos_dist',
+                    xt, x1,
+                    F.cosine_similarity(xt, x1, dim=-1).mean().unsqueeze(0))
         return xt
+
+    def set_epoch(self, epoch):
+        self._epoch = epoch
+        self._batch_in_epoch = 0
+
+    def _stats(self, name, *tensors):
+        """Monitor tensor values — prints first 3 batches of every 10th epoch."""
+        if not hasattr(self, '_epoch'):
+            return
+        if self._epoch % 10 != 0:
+            return
+        self._batch_in_epoch += 1
+        if self._batch_in_epoch > 3:
+            return
+        import logging
+        logger = logging.getLogger(__name__)
+        parts = [f'\n[SBStat epoch={self._epoch} batch={self._batch_in_epoch}] {name}:']
+        for t in tensors:
+            parts.append(f'  shape={list(t.shape)} mean={t.mean().item():.4f} std={t.std().item():.4f} '
+                         f'min={t.min().item():.4f} max={t.max().item():.4f} '
+                         f'nan={t.isnan().any().item()}')
+        msg = ' '.join(parts)
+        logger.info(msg)
 
     def forward(self, item_rep, item_tag, mask_seq, side_seq=None):
         if item_rep.dim() == 3:
@@ -340,5 +411,7 @@ class SBRec(nn.Module):
         x0 = item_tag
         t, _ = self.schedule_sampler.sample(item_rep.shape[0], item_tag.device)
         x_t = self.q_sample(t, x0.detach(), x1.detach())
-        pred_x0, _, pred_x1 = self.xstart_model(item_rep, x_t, self._scale_timesteps(t), mask_seq, side_seq=side_seq)
+        self._stats('q_sample: x0(item_tag) / x1(pooled) / x_t', x0, x1, x_t)
+        pred_x0, seq_feat, pred_x1 = self.xstart_model(item_rep, x_t, self._scale_timesteps(t), mask_seq, side_seq=side_seq)
+        self._stats('xstart_out: pred_x0 / pred_x1 / x1', pred_x0, pred_x1, x1)
         return pred_x0, x1, pred_x1

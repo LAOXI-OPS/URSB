@@ -203,6 +203,7 @@ def model_train(train_data, val_data, test_data, model_joint, args, logger, forw
 
     for epoch_temp in range(epochs):
         model_joint.train()
+        model_joint.set_epoch(epoch_temp)
         flag_update = 0
 
         for batch in train_loader:
