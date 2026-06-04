@@ -35,6 +35,8 @@ DATASET_ALIASES = {
     'sports': 'sports_and_outdoors',
     'toys_and_games': 'toys_and_games',
     'toys': 'toys_and_games',
+    'douban': 'doubanmovie',
+    'doubanmovie': 'doubanmovie',
 }
 
 TXT_SOURCE_MAP = {
