@@ -44,10 +44,8 @@ TXT_SOURCE_MAP = {
 }
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--s_dataset', default='movie')
-parser.add_argument('--t_dataset', default='video')
-parser.add_argument('--p', type=float, default=0.3)
-parser.add_argument('--w', type=float, default=1.0)
+parser.add_argument('--s_dataset', default='books')
+parser.add_argument('--t_dataset', default='elec')
 parser.add_argument('--log_file', default='log/')
 parser.add_argument('--random_seed', type=int, default=1997)
 parser.add_argument('--max_len', type=int, default=8)
@@ -67,23 +65,16 @@ parser.add_argument('--weight_decay', type=float, default=0)
 parser.add_argument('--momentum', type=float, default=None)
 parser.add_argument('--schedule_sampler_name', type=str, default='lossaware')
 parser.add_argument('--diffusion_steps', type=int, default=32)
-parser.add_argument('--lambda_uncertainty', type=float, default=1.0)
 parser.add_argument('--lambda_x1', type=float, default=0.0)
 parser.add_argument('--lambda_bpr', type=float, default=0.0)
 parser.add_argument('--use_sde', action=argparse.BooleanOptionalAction, default=True, help='Enable SDE stochastic noise')
-parser.add_argument('--rescale_timesteps', default=True)
-parser.add_argument('--interval', type=int, default=1000)
-parser.add_argument('--beta_min', type=float, default=0.01)
-parser.add_argument('--beta_max', type=float, default=50)
 parser.add_argument('--sample_steps', type=int, default=32)
 
-parser.add_argument('--eval_interval', type=int, default=5)
+parser.add_argument('--eval_interval', type=int, default=10)
 parser.add_argument('--patience', type=int, default=50)
 parser.add_argument('--eval_mode', type=str, default='negative', choices=['full', 'negative'])
 parser.add_argument('--num_negatives', type=int, default=100)
 parser.add_argument('--use_position', action=argparse.BooleanOptionalAction, default=True, help='Add position embedding to sequence')
-parser.add_argument('--reverse_noise_scale', type=float, default=0.0, help='Reverse sampling init noise scale')
-parser.add_argument('--sde_reverse_noise', type=float, default=0.0, help='SDE noise per reverse step (0=ODE, 1=match training)')
 parser.add_argument('--description', type=str, default='SB_norm_score')
 args = parser.parse_args()
 
@@ -242,7 +233,6 @@ def main(args):
 
     args.item_num = target_item_num
     args.lambda_bpr = bpr_val
-    args.eval_interval = 2
     args.epochs = args.ft_epochs
     forward_flag = False
 

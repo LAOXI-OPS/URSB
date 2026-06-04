@@ -16,9 +16,6 @@ class AttSBModel(nn.Module):
         self.position_embeddings = nn.Embedding(args.max_len, args.hidden_size)
         self.LayerNorm = LayerNorm(args.hidden_size, eps=1e-12)
         self.sb = sb
-        self.side_seq_embedding = nn.Embedding(args.source_item_num + 1, self.emb_dim)
-        nn.init.zeros_(self.side_seq_embedding.weight)
-        self.side_seq_embedding.weight.requires_grad = False
         self.use_position = getattr(args, 'use_position', True)
         self.loss_ce = nn.CrossEntropyLoss()
         self.loss_mse = nn.MSELoss()
@@ -28,8 +25,8 @@ class AttSBModel(nn.Module):
     def set_epoch(self, epoch):
         self.sb.set_epoch(epoch)
 
-    def reverse(self, item_rep, item_rep1, noise_x_t, mask_seq):
-        return self.sb.reverse_p_sample(item_rep, item_rep1, noise_x_t, mask_seq)
+    def reverse(self, item_rep, item_rep1, mask_seq):
+        return self.sb.reverse_p_sample(item_rep, item_rep1, None, mask_seq)
 
     def loss_sb_ce(self, rep_sb, labels, forward_flag, x1=None, pred_x1=None):
         if forward_flag:
@@ -72,17 +69,14 @@ class AttSBModel(nn.Module):
         if train_flag:
             if forward_flag:
                 tag_emb = self.souce_embeddings(tag.squeeze(-1))
-                side_seq = self.side_seq_embedding(sequence).mean(dim=1)
             else:
                 tag_emb = self.target_embeddings(tag.squeeze(-1))
-                side_seq = None
-            pred_x0, x1, pred_x1 = self.sb(item_embeddings, tag_emb, mask_seq, side_seq=side_seq)
+            pred_x0, x1, pred_x1 = self.sb(item_embeddings, tag_emb, mask_seq)
             rep_sb = pred_x0
         else:
             x1 = None
             pred_x1 = None
-            noise_x_t = torch.randn_like(item_embeddings[:, -1, :])
-            rep_sb = self.reverse(item_embeddings, item_embeddings, noise_x_t, mask_seq)
+            rep_sb = self.reverse(item_embeddings, item_embeddings, mask_seq)
         return rep_sb, x1, pred_x1
 
 

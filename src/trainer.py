@@ -252,7 +252,7 @@ def model_train(train_data, val_data, test_data, model_joint, args, logger, forw
                     best_epoch['Best_epoch_' + key] = epoch_temp
 
             if flag_update == 0:
-                bad_count += 1
+                bad_count += args.eval_interval
             else:
                 logger.info(best_metrics_dict)
                 logger.info(best_epoch)

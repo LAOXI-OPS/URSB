@@ -8,14 +8,6 @@ import torch.nn.functional as F
 from step_sample import create_named_schedule_sampler
 
 
-def compute_gaussian_product_coef(sigma1, sigma2):
-    denom = sigma1 ** 2 + sigma2 ** 2
-    coef1 = sigma2 ** 2 / denom
-    coef2 = sigma1 ** 2 / denom
-    var = (sigma1 ** 2 * sigma2 ** 2) / denom
-    return coef1, coef2, var
-
-
 def space_indices(num_steps: int, count: int):
     if count <= 0:
         raise ValueError(f"{count=} must be > 0")
@@ -151,36 +143,66 @@ class TransformerRep(nn.Module):
         return hidden
 
 
-class CrossAttention(nn.Module):
-    def __init__(self, hidden_size, heads, dropout):
+class XAttn(nn.Module):
+    """一对多交叉注意力: Q=[B,1,d] × K/V=[B,L,d] → [B,L,d]"""
+    def __init__(self, d, heads=4, dropout=0.1):
         super().__init__()
-        assert hidden_size % heads == 0
-        self.d_head = hidden_size // heads
+        assert d % heads == 0
+        self.d_head = d // heads
         self.heads = heads
-        self.q_proj = nn.Linear(hidden_size, hidden_size)
-        self.k_proj = nn.Linear(hidden_size, hidden_size)
-        self.v_proj = nn.Linear(hidden_size, hidden_size)
-        self.out_proj = nn.Linear(hidden_size, hidden_size)
+        self.q_proj = nn.Linear(d, d)
+        self.k_proj = nn.Linear(d, d)
+        self.v_proj = nn.Linear(d, d)
+        self.out_proj = nn.Linear(d, d)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, query, key_value, kv_mask):
-        B = query.shape[0]
-        q = self.q_proj(query).view(B, -1, self.heads, self.d_head).transpose(1, 2)
-        k = self.k_proj(key_value).view(B, -1, self.heads, self.d_head).transpose(1, 2)
-        v = self.v_proj(key_value).view(B, -1, self.heads, self.d_head).transpose(1, 2)
+    def forward(self, q, kv, mask):
+        B, L, d = kv.shape
+        q = self.q_proj(q).view(B, 1, self.heads, self.d_head).transpose(1, 2)  # [B,h,1,dh]
+        k = self.k_proj(kv).view(B, L, self.heads, self.d_head).transpose(1, 2)  # [B,h,L,dh]
+        v = self.v_proj(kv).view(B, L, self.heads, self.d_head).transpose(1, 2)  # [B,h,L,dh]
 
-        attn = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_head)
+        attn = q @ k.transpose(-2, -1) / math.sqrt(self.d_head)  # [B,h,1,L]
+        if mask is not None:
+            attn = attn.masked_fill(mask.unsqueeze(1).unsqueeze(2) == 0, -1e9)
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
 
-        if kv_mask is not None:
-            mask = kv_mask.unsqueeze(1).unsqueeze(2)
-            attn = attn.masked_fill(mask == 0, -1e9)
+        out = attn.transpose(-2, -1) * v  # [B,h,L,1]×[B,h,L,dh] → [B,h,L,dh]
+        out = out.transpose(1, 2).contiguous().view(B, L, d)
+        return self.out_proj(out)
 
-        attn_weights = F.softmax(attn, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        out = torch.matmul(attn_weights, v)
-        out = out.transpose(1, 2).contiguous().view(B, -1, self.heads * self.d_head)
-        out = self.out_proj(out)
-        return out
+
+class X1Encoder(nn.Module):
+    def __init__(self, d_model, n_heads=4, max_len=50, dropout=0.1):
+        super().__init__()
+        self.pos_emb = nn.Embedding(max_len, d_model)
+
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True, dropout=dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout),
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(self, seq):
+        B, L, d = seq.shape
+
+        pos = th.arange(L, device=seq.device)
+        seq = seq + self.pos_emb(pos).unsqueeze(0)
+
+        causal_mask = th.triu(th.full((L, L), float('-inf'), device=seq.device), diagonal=1)
+
+        seq_new, _ = self.self_attn(seq, seq, seq, attn_mask=causal_mask)
+        seq = self.norm1(seq + seq_new)
+
+        seq = self.norm2(seq + self.ffn(seq))
+        return seq[:, -1, :]  # [B, d]
 
 
 class SBXstart(nn.Module):
@@ -193,16 +215,10 @@ class SBXstart(nn.Module):
             SiLU(),
             nn.Linear(time_embed_dim, self.hidden_size),
         )
-        self.seq_att = TransformerRep(args)
-        self.seq_norm = LayerNorm(self.hidden_size)
 
-        self.cross_attn = CrossAttention(self.hidden_size, heads=4, dropout=args.dropout)
-        self.cross_norm1 = LayerNorm(self.hidden_size)
-        self.cross_norm2 = LayerNorm(self.hidden_size)
-        self.cross_ffn = PositionwiseFeedForward(self.hidden_size, args.dropout)
-
-        self.lambda_uncertainty = args.lambda_uncertainty
-        self.dropout = nn.Dropout(args.dropout)
+        self.x_attn = XAttn(self.hidden_size, heads=4, dropout=args.dropout)
+        self.post_trm = TransformerRep(args)
+        self.post_norm = LayerNorm(self.hidden_size)
         self.x1_head = nn.Linear(self.hidden_size, self.hidden_size)
 
     def timestep_embedding(self, timesteps, dim, max_period=10000):
@@ -215,154 +231,79 @@ class SBXstart(nn.Module):
             embedding = th.cat([embedding, th.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
-    def forward(self, rep_item, x_t, t, mask_seq, side_seq=None):
-        # 1. Time embedding on x_t (noise state)
+    def forward(self, rep_item, x_t, t, mask_seq):
+        # 1. Time embedding
         emb_t = self.time_embed(self.timestep_embedding(t, self.hidden_size))
         x_t_emb = x_t + emb_t  # [B, d]
 
-        # 2. Uncertainty noise on x_t only (not mixed into sequence)
-        x_t_emb = x_t_emb + self.lambda_uncertainty * th.randn_like(x_t_emb)
+        # 2. 一对多交叉注意力: Q=[B,1,d], K/V=rep_item → [B,L,d]
+        ca_rep = self.x_attn(x_t_emb, rep_item, mask_seq)  # [B, L, d]
 
-        # 3. Sequence through self-attention (condition encoding)
-        seq_features = self.seq_att(rep_item, mask_seq)  # [B, L, d]
-        seq_features = self.seq_norm(seq_features)
+        # 3. Post-Transformer
+        out_seq = self.post_trm(rep_item, mask_seq)  # TEMP: skip x_t
+        out_seq = self.post_norm(out_seq)
 
-        # 4. Cross-attention: x_t (query) attends to seq_features (key/value)
-        x_t_query = x_t_emb.unsqueeze(1)  # [B, 1, d]
-        cross_out = self.cross_attn(self.cross_norm1(x_t_query), seq_features, mask_seq)
-        x_t_out = x_t_emb.unsqueeze(1) + self.dropout(cross_out)  # [B, 1, d]
-
-        # 5. FFN
-        x_t_out = x_t_out + self.dropout(self.cross_ffn(self.cross_norm2(x_t_out)))
-
-        out = x_t_out.squeeze(1)  # [B, d]
+        # 4. Mean pool → [B, d]
+        out = out_seq.mean(dim=1)
         pred_x1 = self.x1_head(out)
-        return out, seq_features, pred_x1
+        return out, out_seq, pred_x1
 
 
 class SBRec(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.hidden_size = args.hidden_size
-        self.rescale_timesteps = args.rescale_timesteps
-
-        interval = int(getattr(args, "interval", max(int(getattr(args, "diffusion_steps", 32)), 2)))
-        self.num_timesteps = interval
-
-        beta_min = float(getattr(args, "beta_min", 0.01))
-        beta_max = float(getattr(args, "beta_max", 50))
-
-        # Linear noise schedule: g²(t) = beta0 + t*(beta1 - beta0),  f(t) = 0
-        ts = np.arange(interval, dtype=np.float64) / max(interval - 1, 1)
-        sigma_sq = beta_min * ts + (beta_max - beta_min) * ts ** 2 / 2.0
-        sigma_bar_sq = sigma_sq[-1] - sigma_sq
-
-        std_fwd = np.sqrt(sigma_sq)
-        std_bwd = np.sqrt(sigma_bar_sq)
-        sigma_1_sq = float(sigma_sq[-1])
-
-        std_fwd_t = torch.tensor(std_fwd, dtype=torch.float32)
-        std_bwd_t = torch.tensor(std_bwd, dtype=torch.float32)
-
-        # f(t)=0 => alpha_t = alpha_bar_t = 1 for all t
-        alpha_t = torch.ones(interval, dtype=torch.float32)
-        alpha_bar_t = torch.ones(interval, dtype=torch.float32)
-
-        mu_x0, mu_x1, _ = compute_gaussian_product_coef(std_fwd_t, std_bwd_t)
-
-        self.register_buffer("std_fwd", std_fwd_t)
-        self.register_buffer("std_bwd", std_bwd_t)
-        self.register_buffer("alpha", alpha_t)
-        self.register_buffer("alpha_bar", alpha_bar_t)
-        self.register_buffer("mu_x0", mu_x0)
-        self.register_buffer("mu_x1", mu_x1)
-        self.register_buffer("sigma_1_sq", torch.tensor(sigma_1_sq, dtype=torch.float32))
-
-        self.sample_steps = max(2, min(int(getattr(args, "sample_steps", 32)), self.num_timesteps))
+        self.num_timesteps = args.diffusion_steps
+        self.sample_steps = max(2, min(args.sample_steps, self.num_timesteps))
         schedule_sampler_name = getattr(args, "schedule_sampler_name", "uniform")
         self.schedule_sampler = create_named_schedule_sampler(schedule_sampler_name, self.num_timesteps)
-
         self.xstart_model = SBXstart(self.hidden_size, args)
-        self.x1_pool_query = nn.Parameter(torch.randn(self.hidden_size))
         self.use_sde = getattr(args, 'use_sde', False)
-        self.reverse_noise_scale = float(getattr(args, 'reverse_noise_scale', 0.0))
-        self.sde_reverse_noise = float(getattr(args, 'sde_reverse_noise', 0.0))
 
     def _expand(self, v, x):
         while v.dim() < x.dim():
             v = v.unsqueeze(-1)
         return v
 
-    def _pool_sequence(self, seq, mask):
-        attn_scores = th.matmul(seq, self.x1_pool_query)  # [B, L]
-        if mask is not None:
-            attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
-        attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)  # [B, L, 1]
-        return (seq * attn_weights).sum(dim=1)  # [B, d]
-
     def _scale_timesteps(self, t):
-        if self.rescale_timesteps:
-            return t.float() * (1000.0 / self.num_timesteps)
-        return t
+        return t.float() * (1000.0 / self.num_timesteps)
 
     def q_sample(self, step, x0, x1):
         assert x0.shape == x1.shape
-        mu0 = self._expand(self.alpha[step] * self.mu_x0[step], x0)
-        mu1 = self._expand(self.alpha_bar[step] * self.mu_x1[step], x0)
-        xt = mu0 * x0 + mu1 * x1
+        t = step / (self.num_timesteps - 1)  # normalized [0, 1]
+        if not isinstance(t, th.Tensor):
+            t = th.tensor(t, device=x0.device, dtype=x0.dtype)
+        t = self._expand(t, x0)
+        xt = (1 - t) * x0 + t * x1
         if self.use_sde:
-            sigma_t = self._expand(self.std_fwd[step], x0)
-            sigma_bar_t = self._expand(self.std_bwd[step], x0)
-            noise_std = th.sqrt(sigma_t ** 2 * sigma_bar_t ** 2 / self.sigma_1_sq)
+            noise_std = th.sqrt(t * (1 - t))
             xt = xt + noise_std * th.randn_like(xt)
         return xt.detach()
 
     def ode_step_reverse(self, t, s, x_s, pred_x0, x1):
-        sigma_bar_s = self.std_bwd[s]
+        # Closed-form reverse: x_s = A·x_t + B·x_1 + C·x_0
+        # Derived from forward interpolation x_t = (1-t)x_0 + t·x_1 + √(t(1-t))ε
+        norm_s = s / (self.num_timesteps - 1)   # current (noisier)
+        norm_t = t / (self.num_timesteps - 1)   # target (cleaner)
 
-        # At endpoint (σ̄_s ≈ 0): shared-noise formula degenerates; use direct interpolation
-        if sigma_bar_s < 1e-8:
+        if norm_s >= 1.0 - 1e-8:
             return self.q_sample(t, pred_x0, x1)
 
-        sigma_t = self.std_fwd[t]
-        sigma_s = self.std_fwd[s]
-        sigma_bar_t = self.std_bwd[t]
-        a_t = self.alpha[t]
-        a_s = self.alpha[s]
-        a_1 = self.alpha[-1]
+        A = math.sqrt(norm_t * (1 - norm_t) / (norm_s * (1 - norm_s)))
+        B = norm_t - norm_s * A
+        C = (1 - norm_t) - (1 - norm_s) * A
 
-        inv_sigma_1_sq = 1.0 / self.sigma_1_sq
+        A = self._expand(th.tensor(A, device=x_s.device, dtype=x_s.dtype), x_s)
+        B = self._expand(th.tensor(B, device=x_s.device, dtype=x_s.dtype), x_s)
+        C = self._expand(th.tensor(C, device=x_s.device, dtype=x_s.dtype), x_s)
 
-        coef_xs = a_t * sigma_t * sigma_bar_t / (a_s * sigma_s * sigma_bar_s)
-        coef_f = a_t * (sigma_bar_t ** 2 - sigma_bar_s * sigma_t * sigma_bar_t / sigma_s) * inv_sigma_1_sq
-        coef_x1 = a_t * (sigma_t ** 2 - sigma_s * sigma_t * sigma_bar_t / sigma_bar_s) * inv_sigma_1_sq / a_1
-
-        coef_xs = self._expand(coef_xs, x_s)
-        coef_f = self._expand(coef_f, x_s)
-        coef_x1 = self._expand(coef_x1, x_s)
-
-        x_t = coef_xs * x_s + coef_f * pred_x0 + coef_x1 * x1
-
-        if self.sde_reverse_noise > 0:
-            noise_std = sigma_t * sigma_bar_t / th.sqrt(self.sigma_1_sq)
-            noise_std = self._expand(noise_std, x_t)
-            x_t = x_t + self.sde_reverse_noise * noise_std * th.randn_like(x_t)
-
-        return x_t
+        return A * x_s + B * x1 + C * pred_x0
 
     def reverse_p_sample(self, item_rep, item_rep1, noise_x_t, mask_seq):
-        if item_rep.dim() == 3:
-            x1 = self._pool_sequence(item_rep, mask_seq)
-        elif item_rep.dim() == 2:
-            x1 = item_rep
-        else:
-            raise ValueError("Unsupported tensor shape for SB endpoint x1")
+        x1 = item_rep.mean(dim=1)
 
         steps = space_indices(self.num_timesteps, self.sample_steps)
-        xt = x1.detach() + self.reverse_noise_scale * noise_x_t
-        if self.reverse_noise_scale > 0:
-            self._stats('reverse_init_noisy: scale/ x1 / xt',
-                        th.tensor([self.reverse_noise_scale]), x1, xt)
+        xt = x1.detach()
         rev = list(steps)[::-1]
         self._stats('reverse_init: x1 / xt', x1, xt)
 
@@ -400,18 +341,12 @@ class SBRec(nn.Module):
         msg = ' '.join(parts)
         logger.info(msg)
 
-    def forward(self, item_rep, item_tag, mask_seq, side_seq=None):
-        if item_rep.dim() == 3:
-            x1 = self._pool_sequence(item_rep, mask_seq)
-        elif item_rep.dim() == 2:
-            x1 = item_rep
-        else:
-            raise ValueError("Unsupported tensor shape for SB endpoint x1")
-
+    def forward(self, item_rep, item_tag, mask_seq):
+        x1 = item_rep.mean(dim=1)
         x0 = item_tag
         t, _ = self.schedule_sampler.sample(item_rep.shape[0], item_tag.device)
         x_t = self.q_sample(t, x0.detach(), x1.detach())
         self._stats('q_sample: x0(item_tag) / x1(pooled) / x_t', x0, x1, x_t)
-        pred_x0, seq_feat, pred_x1 = self.xstart_model(item_rep, x_t, self._scale_timesteps(t), mask_seq, side_seq=side_seq)
+        pred_x0, seq_feat, pred_x1 = self.xstart_model(item_rep, x_t, self._scale_timesteps(t), mask_seq)
         self._stats('xstart_out: pred_x0 / pred_x1 / x1', pred_x0, pred_x1, x1)
         return pred_x0, x1, pred_x1
